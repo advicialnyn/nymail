@@ -35,7 +35,11 @@ const fx = (url, opts) => {
 };
 const json = (o) => new Response(JSON.stringify(o, null, 2), { headers: { "content-type": "application/json" } });
 
-const providerHost = (env) => new URL(env.MAIL_API || "https://api.mail.tm").hostname.replace(/^api\./, "");
+// MAIL_API can hold several providers, comma separated (more providers = more domains)
+const bases = (env) => (env.MAIL_API || "https://api.mail.tm").split(",").map((x) => x.trim().replace(/\/$/, "")).filter(Boolean);
+const provKey = (base) => new URL(base).hostname.replace(/^api\./, "");
+const baseFor = (env, key) => bases(env).find((b) => provKey(b) === key) || bases(env)[0];
+const credits = (env) => bases(env).map((b) => `<a href="https://${provKey(b)}">${provKey(b)}</a>`).join(" &amp; ");
 const helpText = (env) => `📬 <b>Temp Mail Bot</b>
 
 /new — random address
@@ -50,7 +54,7 @@ const helpText = (env) => `📬 <b>Temp Mail Bot</b>
 New emails are posted to your channel within about a minute.
 ⚠️ Addresses are on shared public domains — don't use them for anything important.
 
-Powered by <a href="https://${providerHost(env)}">${providerHost(env)}</a>`;
+Powered by ${credits(env)}`;
 
 export default {
   async fetch(request, env, ctx) {
@@ -115,7 +119,7 @@ async function setup(url, env) {
     commands: commands.ok ? "ok" : commands.description,
     channel_post: channel.ok ? "ok" : channel.description,
     owner_chat: owner.ok ? "ok" : `${owner.description} — open your bot in Telegram and press Start`,
-    mail_api_domains: domains,
+    mail_domains: Array.isArray(domains) ? domains.map((d) => `${d.domain} (${d.api})`) : domains,
     note: "Cron trigger (every minute) must be enabled, otherwise no mail is checked.",
   });
 }
@@ -187,12 +191,12 @@ async function loadState(env) {
     .slice(1)
     .map((l) => l.trim().split("|"))
     .filter((p) => p[0].includes("@"))
-    .map((p) => ({ address: p[0].toLowerCase(), expiry: Number(p[1]) || 0 }));
+    .map((p) => ({ address: p[0].toLowerCase(), expiry: Number(p[1]) || 0, api: p[2] || "" }));
   return { mid: pm.message_id, items };
 }
 
 async function saveState(env, st) {
-  const text = STATE_HEAD + "\n" + st.items.map((i) => `${i.address}|${i.expiry}`).join("\n");
+  const text = STATE_HEAD + "\n" + st.items.map((i) => `${i.address}|${i.expiry}|${i.api || ""}`).join("\n");
   if (st.mid) {
     const r = await tg(env, "editMessageText", { chat_id: env.OWNER_ID, message_id: st.mid, text });
     if (r.ok || /not modified/i.test(r.description || "")) return;
@@ -205,15 +209,14 @@ async function saveState(env, st) {
 
 /* ------------------------------- mail.tm API ------------------------------- */
 
-const apiBase = (env) => (env.MAIL_API || "https://api.mail.tm").replace(/\/$/, "");
 const members = (d) => (Array.isArray(d) ? d : (d && d["hydra:member"]) || []);
 
 async function mt(env, path, o = {}, retried = false) {
   await sleep(110); // stay well under the 8 requests/second limit
   const headers = { Accept: "application/ld+json", ...(o.headers || {}) };
-  if (o.body) headers["Content-Type"] = "application/json";
+  if (o.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
   if (o.token) headers.Authorization = "Bearer " + o.token;
-  const r = await fx(apiBase(env) + path, {
+  const r = await fx((o.base || bases(env)[0]) + path, {
     method: o.method || "GET",
     headers,
     body: o.body ? JSON.stringify(o.body) : undefined,
@@ -243,53 +246,75 @@ async function passFor(env, address) {
 }
 
 async function getDomains(env) {
-  const r = await mt(env, "/domains?page=1");
-  if (!r.ok) throw new Error(`domains request failed (HTTP ${r.status})`);
-  return members(r.data)
-    .filter((d) => d.isActive !== false && !d.isPrivate)
-    .map((d) => d.domain);
+  const out = [];
+  const errors = [];
+  for (const base of bases(env)) {
+    try {
+      const r = await mt(env, "/domains?page=1", { base });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      for (const d of members(r.data)) {
+        if (d.isActive !== false && !d.isPrivate) out.push({ domain: d.domain, api: provKey(base) });
+      }
+    } catch (e) {
+      errors.push(`${provKey(base)}: ${e.message}`);
+    }
+  }
+  if (!out.length) throw new Error("No mail domains available right now" + (errors.length ? ` (${errors.join("; ")})` : ""));
+  return out;
 }
 
-async function createAccount(env, address) {
-  const r = await mt(env, "/accounts", { method: "POST", body: { address, password: await passFor(env, address) } });
+async function createAccount(env, address, base) {
+  const r = await mt(env, "/accounts", { base, method: "POST", body: { address, password: await passFor(env, address) } });
   if (!r.ok) {
     const why = (r.data && (r.data["hydra:description"] || r.data.detail || r.data.message)) || `HTTP ${r.status}`;
     throw new Error(r.status === 429 ? "Rate limited by mail service — try again in a few seconds" : `Mail service refused: ${why}`);
   }
 }
 
-async function login(env, address) {
-  const r = await mt(env, "/token", { method: "POST", body: { address, password: await passFor(env, address) } });
+async function login(env, address, base) {
+  const r = await mt(env, "/token", { base, method: "POST", body: { address, password: await passFor(env, address) } });
   if (!r.ok || !r.data || !r.data.token) {
     const e = new Error(`login failed (HTTP ${r.status})`);
     e.status = r.status;
     throw e;
   }
-  return r.data; // { id, token }
+  return { ...r.data, base }; // { id, token, base }
 }
 
-async function destroy(env, address) {
+async function destroy(env, item) {
   let auth;
   try {
-    auth = await login(env, address);
+    auth = await login(env, item.address, baseFor(env, item.api));
   } catch (e) {
     if (e.status === 401 || e.status === 404) return; // already gone
     throw e;
   }
-  const r = await mt(env, `/accounts/${auth.id}`, { method: "DELETE", token: auth.token });
+  const r = await mt(env, `/accounts/${auth.id}`, { base: auth.base, method: "DELETE", token: auth.token });
   if (!r.ok && r.status !== 404) throw new Error(`delete failed (HTTP ${r.status})`);
 }
 
-async function markSeen(env, token, id) {
-  let r = await mt(env, `/messages/${id}`, {
+// Mark a message as read. If that ever fails, delete it instead — the email is already in
+// Telegram, and this guarantees it can never be forwarded twice.
+async function markSeen(env, auth, id) {
+  const path = `/messages/${id}`;
+  const { token, base } = auth;
+  let r = await mt(env, path, {
+    base,
     method: "PATCH",
     token,
     headers: { "Content-Type": "application/merge-patch+json" },
+    body: { seen: true },
   });
-  if (!r.ok && (r.status === 415 || r.status === 400)) {
-    r = await mt(env, `/messages/${id}`, { method: "PATCH", token, body: {} });
-  }
-  return r.ok;
+  if (r.ok) return true;
+  console.error("markSeen PATCH failed", r.status);
+
+  r = await mt(env, path, { base, method: "PATCH", token, body: { seen: true } }); // plain JSON fallback
+  if (r.ok) return true;
+
+  r = await mt(env, path, { base, method: "DELETE", token });
+  if (r.ok || r.status === 404) return true;
+  console.error("markSeen DELETE failed", r.status);
+  return false;
 }
 
 /* ------------------------------- polling ------------------------------- */
@@ -307,20 +332,19 @@ async function poll(env) {
     if (SUB > 36) break; // leave the rest for the next run
 
     if (it.expiry && it.expiry < now) {
-      await destroy(env, it.address).catch((e) => console.error("expire", it.address, e.message));
+      await destroy(env, it).catch((e) => console.error("expire", it.address, e.message));
       gone.add(it.address);
       continue;
     }
 
     try {
-      const auth = await login(env, it.address);
-      const list = await mt(env, "/messages?page=1", { token: auth.token });
+      const auth = await login(env, it.address, baseFor(env, it.api));
+      const list = await mt(env, "/messages?page=1", { base: auth.base, token: auth.token });
       if (!list.ok) throw new Error(`messages request failed (HTTP ${list.status})`);
       const unseen = members(list.data).filter((m) => !m.seen).reverse(); // oldest first
       for (const sm of unseen) {
         if (SUB > 36) break;
-        await forward(env, auth, sm);
-        result.forwarded++;
+        if (await forward(env, auth, sm)) result.forwarded++;
       }
     } catch (e) {
       console.error("poll", it.address, e.message);
@@ -341,9 +365,10 @@ async function poll(env) {
 }
 
 async function forward(env, auth, sm) {
-  const d = await mt(env, `/messages/${sm.id}`, { token: auth.token });
+  const d = await mt(env, `/messages/${sm.id}`, { base: auth.base, token: auth.token });
   if (!d.ok) throw new Error(`message request failed (HTTP ${d.status})`);
   const m = d.data;
+  if (m.seen === true) return false; // already handled earlier — never forward twice
 
   const fo = m.from || sm.from || {};
   const from = (fo.name ? `${fo.name} <${fo.address}>` : fo.address || "unknown").slice(0, 200);
@@ -385,7 +410,7 @@ async function forward(env, auth, sm) {
   for (const a of sendable) {
     try {
       await sleep(110);
-      const url = /^https?:/.test(a.downloadUrl) ? a.downloadUrl : apiBase(env) + a.downloadUrl;
+      const url = /^https?:/.test(a.downloadUrl) ? a.downloadUrl : auth.base + a.downloadUrl;
       const r = await fx(url, { headers: { Authorization: "Bearer " + auth.token } });
       if (r.ok) await tgDoc(env, env.CHANNEL_ID, await r.blob(), a.filename || "file", `📎 ${a.filename || "attachment"}`);
     } catch (e) {
@@ -395,16 +420,21 @@ async function forward(env, auth, sm) {
 
   // full original for long messages
   if (truncated) {
-    const s = await mt(env, `/sources/${sm.id}`, { token: auth.token });
+    const s = await mt(env, `/sources/${sm.id}`, { base: auth.base, token: auth.token });
     if (s.ok && s.data && s.data.data) {
       await tgDoc(env, env.CHANNEL_ID, new Blob([s.data.data], { type: "message/rfc822" }), `mail-${Date.now()}.eml`, "📎 Original message (.eml)");
     }
   }
 
   // mark as read only after it reached Telegram (so a failure retries next minute)
-  if (!(await markSeen(env, auth.token, sm.id)) && !(await markSeen(env, auth.token, sm.id))) {
-    console.error("could not mark message as read — it may be forwarded again", sm.id);
+  try {
+    if (!(await markSeen(env, auth, sm.id))) {
+      console.error("could not mark message as handled — it may be forwarded again", sm.id);
+    }
+  } catch (e) {
+    console.error("markSeen error", e.message);
   }
+  return true;
 }
 
 function findCode(t) {
@@ -489,7 +519,7 @@ async function handleUpdate(u, env) {
         break;
       case "/domains": {
         const d = await getDomains(env);
-        await send(env, chat, d.length ? "🌐 <b>Available domains</b>\n" + d.map((x) => `• <code>${esc(x)}</code>`).join("\n") + "\n\nUse <code>/new name@domain</code>" : "No active domains right now.");
+        await send(env, chat, "🌐 <b>Available domains</b>\n" + d.map((x) => `• <code>${esc(x.domain)}</code> (${esc(x.api)})`).join("\n") + "\n\nUse <code>/new name@domain</code>");
         break;
       }
       case "/check": {
@@ -528,20 +558,25 @@ async function cmdNew(env, chat, args) {
     return void (await send(env, chat, `❌ Limit is ${MAX_ADDRESSES} addresses. Delete some with /list.`));
   }
 
-  const domains = await getDomains(env);
-  if (!domains.length) throw new Error("No active mail domains right now, try again later.");
-  if (domain && !domains.includes(domain)) {
-    return void (await send(env, chat, `❌ Unknown domain. Available: ${domains.map((d) => "<code>" + esc(d) + "</code>").join(", ")}`));
+  const all = await getDomains(env);
+  let pick;
+  if (domain) {
+    pick = all.find((d) => d.domain === domain);
+    if (!pick) {
+      return void (await send(env, chat, `❌ Unknown domain. Available: ${all.map((d) => "<code>" + esc(d.domain) + "</code>").join(", ")}`));
+    }
+  } else {
+    pick = local ? all[0] : all[Math.floor(Math.random() * all.length)];
   }
 
-  const address = `${local || randomName()}@${domain || domains[0]}`;
+  const address = `${local || randomName()}@${pick.domain}`;
   if (st.items.some((i) => i.address === address)) {
     return void (await send(env, chat, `❌ <code>${esc(address)}</code> already exists.`));
   }
 
-  await createAccount(env, address);
+  await createAccount(env, address, baseFor(env, pick.api));
   const expiry = ttl ? Date.now() + ttl : 0;
-  st.items.push({ address, expiry });
+  st.items.push({ address, expiry, api: pick.api });
   await saveState(env, st);
 
   await send(
@@ -560,7 +595,7 @@ async function removeAddress(env, address) {
   if (!item) return { found: false };
   let warn = "";
   try {
-    await destroy(env, address);
+    await destroy(env, item);
   } catch (e) {
     warn = e.message;
   }
@@ -612,7 +647,7 @@ async function handleCallback(q, env) {
       await edit(env, chat, mid, v.text, v.markup);
     } else if (action === "delall") {
       const st = await loadState(env);
-      for (const it of st.items) await destroy(env, it.address).catch(() => {});
+      for (const it of st.items) await destroy(env, it).catch(() => {});
       const n = st.items.length;
       st.items = [];
       await saveState(env, st);
