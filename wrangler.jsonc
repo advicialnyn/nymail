@@ -4,14 +4,8 @@
   "compatibility_date": "2025-06-01",
   "workers_dev": true,
   "observability": { "enabled": true },
-
-  // REQUIRED: checks your temp mailboxes for new mail every minute
   "triggers": { "crons": ["* * * * *"] },
-
-  // Non-secret setting. Add these in the dashboard (Settings -> Variables and Secrets):
-  //   Secrets: BOT_TOKEN, WEBHOOK_SECRET
-  //   Text/Secret: CHANNEL_ID, OWNER_ID
   "vars": {
-    "MAIL_API": "https://api.mail.tm"
+    "MAIL_API": "https://api.mail.tm,https://api.mail.gw"
   }
 }
